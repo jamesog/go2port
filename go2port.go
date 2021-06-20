@@ -3,18 +3,23 @@ package main
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
 	"text/template"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"github.com/urfave/cli"
@@ -276,6 +281,29 @@ type Dependency struct {
 	Version string `toml:"revision"`
 }
 
+// reverseDepByName implements sort.Interface for []Dependency based on the
+// Path field.
+type reverseDepByName []Dependency
+
+func (d reverseDepByName) Len() int           { return len(d) }
+func (d reverseDepByName) Swap(i, j int)      { d[i], d[j] = d[j], d[i] }
+func (d reverseDepByName) Less(i, j int) bool { return d[j].Name < d[i].Name }
+
+// Module is a Go module as described in `go help list`.
+type Module struct {
+	Path      string     // module path
+	Version   string     // module version
+	Versions  []string   // available module versions (with -versions)
+	Replace   *Module    // replaced by this module
+	Time      *time.Time // time version was created
+	Main      bool       // is this the main module?
+	Indirect  bool       // is this module only an indirect dependency of main module?
+	Dir       string     // directory holding files for this module, if any
+	GoMod     string     // path to go.mod file used when loading this module, if any
+	GoVersion string     // go version used in module
+	Retracted string     // retraction information, if any (with -retracted or -u)
+}
+
 type GlideLock struct {
 	Imports []Dependency
 }
@@ -290,6 +318,7 @@ func generateOne(pkg Package, tmplate string, lockfileDir string) ([]byte, error
 		msg := fmt.Sprintf("Could not retrieve dependencies for package: %s", pkg.Id)
 		log.Println(msg)
 		log.Println(err)
+		return nil, err
 	}
 
 	var buf bytes.Buffer
@@ -443,7 +472,7 @@ func resolvePackage(pkg string) ([]string, error) {
 }
 
 func dependencies(pkg Package, lockfileDir string) ([]Dependency, error) {
-	deps, err := moduleDependencies(pkg, lockfileDir)
+	deps, err := moduleDependenciesNew(pkg, lockfileDir)
 	if err == nil {
 		return deps, nil
 	}
@@ -473,6 +502,96 @@ func rawFileUrl(pkg Package, dir string, file string) (string, error) {
 	default:
 		return "", errors.New(fmt.Sprintf("Unsupported domain: %s", pkg.Host))
 	}
+}
+
+func modFetch(url string) (io.ReadCloser, error) {
+	file := path.Base(url)
+	resp, err := http.Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("couldn't download %s: %w", file, err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("couldn't find %s at %s", file, url)
+	}
+
+	return resp.Body, nil
+}
+
+func modWrite(data io.ReadCloser, dirname, filename string) error {
+	f, err := os.Create(filepath.Join(dirname, filename))
+	if err != nil {
+		return fmt.Errorf("couldn't create %s: %w", filename, err)
+	}
+	_, err = io.Copy(f, data)
+	if err != nil {
+		return fmt.Errorf("couldn't write temporary %s: %w", filename, err)
+	}
+	return f.Close()
+}
+
+func modDownload(pkg Package, lockfileDir string) (string, error) {
+	tmpDir, err := os.MkdirTemp(".", pkg.Project)
+	if err != nil {
+		return "", fmt.Errorf("couldn't create temporary directory: %w", err)
+	}
+
+	for _, file := range []string{"go.mod", "go.sum"} {
+		modURL, err := rawFileUrl(pkg, lockfileDir, file)
+		if err != nil {
+			return "", err
+		}
+		gomod, err := modFetch(modURL)
+		if err != nil {
+			return "", fmt.Errorf("couldn't fetch %s: %w", file, err)
+		}
+		if err := modWrite(gomod, tmpDir, file); err != nil {
+			return "", err
+		}
+	}
+
+	return tmpDir, nil
+}
+
+func moduleDependenciesNew(pkg Package, lockfileDir string) ([]Dependency, error) {
+	tmpDir, err := modDownload(pkg, lockfileDir)
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	cmd := exec.Command("go", "list", "-m", "-json", "all")
+	cmd.Dir = tmpDir
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("couldn't execute 'go list': %w", err)
+	}
+
+	var deps []Dependency
+	dec := json.NewDecoder(bytes.NewReader(out))
+	// Decode once and throw it away; the first entry is the module itself
+	dec.Decode(new(struct{}))
+	// Process any remaining modules
+	for {
+		var m Module
+		if err := dec.Decode(&m); err == io.EOF {
+			break
+		} else if err != nil {
+			fmt.Fprintf(os.Stderr, "couldn't parse module: %v", err)
+			continue
+		}
+		name := readName(m.Path)
+		version := readVersion(m.Version)
+		deps = append(deps, Dependency{name, version})
+	}
+
+	// Reverse-sort by package ID in order to
+	// - Have a stable output order, and
+	// - Ensure that IDs that are prefixes of other IDs (foo.com/a/b &
+	//   foo.com/a/bb) come later, which works around some issues identifying
+	//   extracted distfiles in post-extract
+	sort.Sort(reverseDepByName(deps))
+
+	return deps, nil
 }
 
 func moduleDependencies(pkg Package, lockfileDir string) ([]Dependency, error) {
